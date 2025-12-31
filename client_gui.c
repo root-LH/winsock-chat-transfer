@@ -196,12 +196,29 @@ static const char *basename_win(const char *path) {
     return p ? p + 1 : path;
 }
 
-static void make_recv_name(char *out, size_t out_sz, const char *orig) {
-    CreateDirectoryA("received", NULL);
-    snprintf(out, out_sz, "received\\recv_%s", orig);
-    for (char *p = out; *p; ++p) {
-        if (strchr("<>:\"|?*", *p)) *p = '_';
+static void sanitize_filename_only(char *s) {
+    for (char *p = s; *p; ++p) {
+        if (strchr("<>:\"/\\|?*", *p)) *p = '_';
     }
+    if (s[0] == 0) strcpy(s, "file");
+}
+
+static void make_recv_name(char *out, size_t out_sz, const char *orig) {
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+    char *slash = strrchr(exePath, '\\');
+    if (slash) *slash = '\0';
+
+    char recvDir[MAX_PATH];
+    snprintf(recvDir, sizeof(recvDir), "%s\\received", exePath);
+    CreateDirectoryA(recvDir, NULL);
+
+    char fname[260];
+    strncpy(fname, orig, sizeof(fname)-1);
+    fname[sizeof(fname)-1] = 0;
+    sanitize_filename_only(fname);
+
+    snprintf(out, out_sz, "%s\\recv_%s", recvDir, fname);
 }
 
 static LRESULT CALLBACK InputProc(HWND hEdit, UINT msg, WPARAM wParam, LPARAM lParam) {
