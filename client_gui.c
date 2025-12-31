@@ -1,14 +1,5 @@
 #define _CRT_SECURE_NO_WARNINGS
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-#include <commdlg.h>
-#include <commctrl.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <stdarg.h>
+#include "client.h"
 
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Comdlg32.lib")
@@ -80,6 +71,8 @@ static HWND g_pbSend = NULL;
 static HWND g_pbRecv = NULL;
 static HWND g_txSend = NULL;
 static HWND g_txRecv = NULL;
+
+static WNDPROC g_oldInputProc = NULL;
 
 static SOCKET g_sock_chat = INVALID_SOCKET;
 static SOCKET g_sock_file = INVALID_SOCKET;
@@ -209,6 +202,17 @@ static void make_recv_name(char *out, size_t out_sz, const char *orig) {
     for (char *p = out; *p; ++p) {
         if (strchr("<>:\"|?*", *p)) *p = '_';
     }
+}
+
+static LRESULT CALLBACK InputProc(HWND hEdit, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_KEYDOWN && wParam == VK_RETURN) {
+        send_chat(g_hwnd);
+        return 0;
+    }
+    if (msg == WM_CHAR && wParam == '\r') {
+        return 0;
+    }
+    return CallWindowProcA(g_oldInputProc, hEdit, msg, wParam, lParam);
 }
 
 static void close_both(void) {
@@ -705,8 +709,10 @@ static void create_controls(HWND hWnd) {
 
     CreateWindowA("BUTTON", "Connect", WS_CHILD | WS_VISIBLE, 575, 7, 120, 24, hWnd, (HMENU)IDC_CONNECT, NULL, NULL);
 
-    CreateWindowA("EDIT", "", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+    HWND hInput = CreateWindowA("EDIT", "", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
                   10, 40, 555, 24, hWnd, (HMENU)IDC_INPUT, NULL, NULL);
+    g_oldInputProc = (WNDPROC)(LONG_PTR)SetWindowLongPtrA(hInput, GWLP_WNDPROC, (LONG_PTR)InputProc);
+
     CreateWindowA("BUTTON", "Send", WS_CHILD | WS_VISIBLE, 575, 40, 120, 24, hWnd, (HMENU)IDC_SEND, NULL, NULL);
     CreateWindowA("BUTTON", "Send File", WS_CHILD | WS_VISIBLE, 575, 70, 120, 24, hWnd, (HMENU)IDC_SENDFILE, NULL, NULL);
 
