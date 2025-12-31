@@ -14,9 +14,11 @@
 #pragma comment(lib, "Comdlg32.lib")
 #pragma comment(lib, "Comctl32.lib")
 
-#define MSG_TEXT       1
-#define MSG_FILE_BEGIN 2
-#define MSG_FILE_CHUNK 3
+#define MSG_TEXT        1
+#define MSG_FILE_BEGIN  2   // now: OFFER (fname+size)
+#define MSG_FILE_CHUNK  3
+#define MSG_FILE_ACCEPT 4
+#define MSG_FILE_REJECT 5
 
 #define IO_BUF_SZ      (256 * 1024)
 #define FILE_CHUNK_SZ  (256 * 1024)
@@ -57,7 +59,8 @@ typedef struct {
 } progress_msg_t;
 
 typedef struct {
-    int active;
+    int active;     // actively writing file
+    int discard;    // receiver rejected; discard any chunks if they arrive anyway
     FILE *fp;
     char outname[300];
     uint64_t total;
@@ -89,6 +92,11 @@ static volatile LONG g_disc_once = 0;
 
 static CRITICAL_SECTION g_chat_cs;
 static CRITICAL_SECTION g_file_cs;
+
+/* ---- offer wait (sender side) ---- */
+static HANDLE g_ev_offer = NULL;                // manual-reset event
+static volatile LONG g_offer_pending = 0;       // 1 if a send thread is waiting for accept/reject
+static volatile LONG g_offer_result = 0;        // -1 pending, 0 reject, 1 accept
 
 static void ui_append_log(const char *text) {
     if (!g_editLog) return;
@@ -128,7 +136,6 @@ static void post_progress(int which, const char *name, uint64_t done, uint64_t t
 }
 
 static void sanitize_nick(char *s) {
-    // replace spaces/control with underscore
     for (char *p = s; *p; ++p) {
         unsigned char c = (unsigned char)*p;
         if (c <= 32 || c == 127) *p = '_';
@@ -225,6 +232,9 @@ static void close_both(void) {
     }
     LeaveCriticalSection(&g_file_cs);
 
+    // wake sender waiting offer
+    if (g_ev_offer) SetEvent(g_ev_offer);
+
     post_state(0);
     post_logf("[system] Disconnected\r\n");
 }
@@ -305,7 +315,8 @@ end:
     return 0;
 }
 
-static int recv_file_begin(SOCKET s, uint32_t len, recv_file_state_t *st) {
+/* ---- receiver: OFFER handling ---- */
+static int recv_file_begin_offer(SOCKET s, uint32_t len, recv_file_state_t *st) {
     if (len < 2 + 8) return -1;
 
     uint16_t fn_net;
@@ -321,6 +332,35 @@ static int recv_file_begin(SOCKET s, uint32_t len, recv_file_state_t *st) {
     if (recv_all(s, &sz_net, 8) < 0) return -1;
     uint64_t total = ntohll_u64(sz_net);
 
+    // Ask user accept/reject
+    char prompt[512];
+    double mb = (double)total / (1024.0 * 1024.0);
+    snprintf(prompt, sizeof(prompt),
+             "Incoming file:\r\n\r\n  %s\r\n  Size: %.2f MB\r\n\r\nAccept?",
+             fname, mb);
+
+    int ans = MessageBoxA(g_hwnd, prompt, "File Transfer Request",
+                          MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON1);
+
+    if (ans != IDYES) {
+        // reject
+        if (send_frame(s, MSG_FILE_REJECT, NULL, 0) < 0) return -1;
+
+        st->active = 0;
+        st->discard = 1;
+        st->fp = NULL;
+        st->total = total;
+        st->recvd = 0;
+        st->last_speed_bps = 0.0;
+
+        post_logf("[system] Rejected file: %s\r\n", fname);
+        post_progress(1, "(rejected)", 0, total, 0.0, 1);
+        return 0;
+    }
+
+    // accept
+    if (send_frame(s, MSG_FILE_ACCEPT, NULL, 0) < 0) return -1;
+
     char outname[300];
     make_recv_name(outname, sizeof(outname), fname);
 
@@ -328,15 +368,17 @@ static int recv_file_begin(SOCKET s, uint32_t len, recv_file_state_t *st) {
     if (!fp) {
         post_logf("[system] Failed to create file: %s (discard)\r\n", outname);
         st->active = 0;
+        st->discard = 1;
         st->fp = NULL;
         st->total = total;
         st->recvd = 0;
         st->last_speed_bps = 0.0;
-        post_progress(1, outname, 0, total, 0.0, 0);
+        post_progress(1, "(discard)", 0, total, 0.0, 0);
         return 0;
     }
 
     st->active = 1;
+    st->discard = 0;
     st->fp = fp;
     strncpy(st->outname, outname, sizeof(st->outname)-1);
     st->outname[sizeof(st->outname)-1] = 0;
@@ -361,7 +403,7 @@ static int recv_file_chunk(SOCKET s, uint32_t len, recv_file_state_t *st) {
         uint32_t c = remain > IO_BUF_SZ ? IO_BUF_SZ : remain;
         if (recv_all(s, buf, (int)c) < 0) return -1;
 
-        if (st->active && st->fp) fwrite(buf, 1, c, st->fp);
+        if (st->active && st->fp && !st->discard) fwrite(buf, 1, c, st->fp);
         st->recvd += (uint64_t)c;
 
         ULONGLONG now = GetTickCount64();
@@ -373,12 +415,14 @@ static int recv_file_chunk(SOCKET s, uint32_t len, recv_file_state_t *st) {
                 st->last_recvd = st->recvd;
                 st->last_rate_t = now;
             }
-            post_progress(1, st->active ? st->outname : "(discard)", st->recvd, st->total, st->last_speed_bps,
+            post_progress(1,
+                          st->discard ? "(discard)" : (st->outname[0] ? st->outname : "-"),
+                          st->recvd, st->total, st->last_speed_bps,
                           (st->total && st->recvd >= st->total));
             st->last_ui = now;
         }
 
-        if (st->active && st->fp && st->total && st->recvd >= st->total) {
+        if (!st->discard && st->active && st->fp && st->total && st->recvd >= st->total) {
             fclose(st->fp);
             st->fp = NULL;
             st->active = 0;
@@ -410,17 +454,38 @@ static DWORD WINAPI recv_file_loop(LPVOID unused) {
         uint32_t len = ntohl(net_len);
 
         if (type == MSG_FILE_BEGIN) {
-            if (recv_file_begin(s, len, &st) < 0) break;
+            // OFFER
+            if (recv_file_begin_offer(s, len, &st) < 0) break;
+
         } else if (type == MSG_FILE_CHUNK) {
             if (recv_file_chunk(s, len, &st) < 0) break;
+
+        } else if (type == MSG_FILE_ACCEPT || type == MSG_FILE_REJECT) {
+            // sender side: wake up sending thread that is waiting for response
+            // payload should be empty; drain anyway if not
+            if (len > 0) {
+                char dump[IO_BUF_SZ];
+                uint32_t remain = len;
+                while (remain) {
+                    uint32_t c = remain > IO_BUF_SZ ? IO_BUF_SZ : remain;
+                    if (recv_all(s, dump, (int)c) < 0) goto end;
+                    remain -= c;
+                }
+            }
+
+            if (InterlockedCompareExchange(&g_offer_pending, 1, 1) == 1) {
+                InterlockedExchange(&g_offer_result, (type == MSG_FILE_ACCEPT) ? 1 : 0);
+                if (g_ev_offer) SetEvent(g_ev_offer);
+            }
+
         } else if (type == MSG_TEXT) {
-            // allow server notify on file channel too
             char *msg = (char*)malloc((size_t)len + 1);
             if (!msg) break;
             if (len && recv_all(s, msg, (int)len) < 0) { free(msg); break; }
             msg[len] = 0;
             post_logf("%s\r\n", msg);
             free(msg);
+
         } else {
             char dump[IO_BUF_SZ];
             uint32_t remain = len;
@@ -450,14 +515,26 @@ static int send_text_chat_raw(const char *text) {
 static DWORD WINAPI send_file_thread(LPVOID lp) {
     char *path = (char*)lp;
 
+    // only one outgoing file offer at a time (simple)
+    if (InterlockedCompareExchange(&g_offer_pending, 1, 0) != 0) {
+        post_logf("[system] Another file send is already pending.\r\n");
+        free(path);
+        return 0;
+    }
+
     EnterCriticalSection(&g_file_cs);
     SOCKET s = g_sock_file;
     LeaveCriticalSection(&g_file_cs);
-    if (s == INVALID_SOCKET) { free(path); return 0; }
+    if (s == INVALID_SOCKET) {
+        InterlockedExchange(&g_offer_pending, 0);
+        free(path);
+        return 0;
+    }
 
     FILE *fp = fopen(path, "rb");
     if (!fp) {
         post_logf("[system] Failed to open file: %s\r\n", path);
+        InterlockedExchange(&g_offer_pending, 0);
         free(path);
         return 0;
     }
@@ -471,7 +548,12 @@ static DWORD WINAPI send_file_thread(LPVOID lp) {
 
     uint32_t begin_len = (uint32_t)(2u + fname_len + 8u);
     uint8_t *begin_payload = (uint8_t*)malloc(begin_len);
-    if (!begin_payload) { fclose(fp); free(path); return 0; }
+    if (!begin_payload) {
+        fclose(fp);
+        InterlockedExchange(&g_offer_pending, 0);
+        free(path);
+        return 0;
+    }
 
     uint16_t net_fn = htons(fname_len);
     uint64_t net_sz = htonll_u64(fsize);
@@ -480,15 +562,49 @@ static DWORD WINAPI send_file_thread(LPVOID lp) {
     memcpy(begin_payload + 2, fname, fname_len);
     memcpy(begin_payload + 2 + fname_len, &net_sz, 8);
 
+    // reset offer wait
+    InterlockedExchange(&g_offer_result, -1);
+    if (g_ev_offer) ResetEvent(g_ev_offer);
+
+    // send OFFER (MSG_FILE_BEGIN)
     if (send_frame(s, MSG_FILE_BEGIN, begin_payload, begin_len) < 0) {
         free(begin_payload); fclose(fp); free(path);
+        InterlockedExchange(&g_offer_pending, 0);
         close_both();
         return 0;
     }
     free(begin_payload);
 
+    post_logf("[system] File offer sent. Waiting accept...\r\n");
+
+    // wait accept/reject (up to 120 seconds)
+    DWORD wr = WaitForSingleObject(g_ev_offer, 120000);
+    if (wr != WAIT_OBJECT_0) {
+        post_logf("[system] No response (timeout). Cancel.\r\n");
+        fclose(fp);
+        InterlockedExchange(&g_offer_pending, 0);
+        free(path);
+        return 0;
+    }
+
+    LONG res = InterlockedCompareExchange(&g_offer_result, g_offer_result, g_offer_result);
+    if (res != 1) {
+        post_logf("[system] Receiver rejected the file.\r\n");
+        fclose(fp);
+        InterlockedExchange(&g_offer_pending, 0);
+        free(path);
+        return 0;
+    }
+
+    post_logf("[system] Receiver accepted. Sending...\r\n");
+
     uint8_t *buf = (uint8_t*)malloc(FILE_CHUNK_SZ);
-    if (!buf) { fclose(fp); free(path); return 0; }
+    if (!buf) {
+        fclose(fp);
+        InterlockedExchange(&g_offer_pending, 0);
+        free(path);
+        return 0;
+    }
 
     uint64_t sent = 0;
     ULONGLONG start = GetTickCount64();
@@ -502,6 +618,7 @@ static DWORD WINAPI send_file_thread(LPVOID lp) {
 
         if (send_frame(s, MSG_FILE_CHUNK, buf, (uint32_t)n) < 0) {
             free(buf); fclose(fp); free(path);
+            InterlockedExchange(&g_offer_pending, 0);
             close_both();
             return 0;
         }
@@ -523,6 +640,7 @@ static DWORD WINAPI send_file_thread(LPVOID lp) {
     post_progress(0, fname, fsize, fsize, 0.0, 1);
     post_logf("[system] File send finished: %s\r\n", fname);
 
+    InterlockedExchange(&g_offer_pending, 0);
     free(path);
     return 0;
 }
@@ -664,7 +782,7 @@ static void pick_and_send_file(HWND hWnd) {
     if (!dup) return;
 
     CreateThread(NULL, 0, send_file_thread, dup, 0, NULL);
-    post_logf("[system] File sending started\r\n");
+    post_logf("[system] File send requested\r\n");
 }
 
 static void send_chat(HWND hWnd) {
@@ -820,6 +938,9 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     InitializeCriticalSection(&g_chat_cs);
     InitializeCriticalSection(&g_file_cs);
 
+    // offer wait event (manual-reset)
+    g_ev_offer = CreateEventA(NULL, TRUE, FALSE, NULL);
+
     WNDCLASSA wc;
     memset(&wc, 0, sizeof(wc));
     wc.lpfnWndProc = WndProc;
@@ -850,6 +971,8 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
         TranslateMessage(&m);
         DispatchMessageA(&m);
     }
+
+    if (g_ev_offer) { CloseHandle(g_ev_offer); g_ev_offer = NULL; }
 
     DeleteCriticalSection(&g_chat_cs);
     DeleteCriticalSection(&g_file_cs);
