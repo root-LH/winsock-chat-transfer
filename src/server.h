@@ -12,6 +12,7 @@
 #define MSG_TEXT       1
 #define MSG_FILE_BEGIN 2
 #define MSG_FILE_CHUNK 3
+#define MSG_FILE_CANCEL 6
 
 #define MAX_ROOMS 64
 #define ROOM_NAME_MAX 64

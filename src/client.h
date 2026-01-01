@@ -14,6 +14,7 @@
 #define MSG_FILE_CHUNK  3
 #define MSG_FILE_ACCEPT 4
 #define MSG_FILE_REJECT 5
+#define MSG_FILE_CANCEL 6
 
 #define IO_BUF_SZ      (256 * 1024)
 #define FILE_CHUNK_SZ  (256 * 1024)
@@ -86,4 +87,5 @@ static void send_chat(HWND hWnd);
 static int do_connect(HWND hWnd);
 static void do_disconnect(void);
 static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+static void send_file_cancel_notify(const char *fname);
 int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow);

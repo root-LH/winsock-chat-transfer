@@ -14,6 +14,7 @@ enum {
     IDC_INPUT,
     IDC_SEND,
     IDC_SENDFILE,
+    IDC_CANCELFILE,
     IDC_LOG,
     IDC_PB_SEND,
     IDC_PB_RECV,
@@ -38,6 +39,10 @@ static HANDLE g_thr_file = NULL;
 
 static volatile LONG g_connected = 0;
 static volatile LONG g_disc_once = 0;
+
+static HANDLE g_send_cancel_ev = NULL;
+static volatile LONG g_send_inflight = 0;
+static char g_send_cur_name[260] = {0};
 
 static CRITICAL_SECTION g_chat_cs;
 static CRITICAL_SECTION g_file_cs;
@@ -455,6 +460,27 @@ static DWORD WINAPI recv_file_loop(LPVOID unused) {
                 if (g_ev_offer) SetEvent(g_ev_offer);
             }
 
+        } else if (type == MSG_FILE_CANCEL){
+            uint16_t fn_net = 0;
+            uint16_t fn_len = 0;
+            char namebuf[260] = {0};
+
+            if (len >= 2) {
+                if (recv_all(s, &fn_net, 2) < 0) break;
+                fn_len = ntohs(fn_net);
+                if (fn_len > 0 && fn_len < 260 && (uint32_t)(2 + fn_len) <= len) {
+                    if (recv_all(s, namebuf, fn_len) < 0) break;
+                    namebuf[fn_len] = 0;
+                } else {
+                    uint32_t remain = len - 2;
+                    char dump[IO_BUF_SZ];
+                    while (remain) {
+                        uint32_t c = remain > IO_BUF_SZ ? IO_BUF_SZ : remain;
+                        if (recv_all(s, dump, (int)c) < 0) goto end;
+                        remain -= c;
+                    }
+                }
+            }
         } else if (type == MSG_TEXT) {
             char *msg = (char*)malloc((size_t)len + 1);
             if (!msg) break;
@@ -498,6 +524,13 @@ static DWORD WINAPI send_file_thread(LPVOID lp) {
         free(path);
         return 0;
     }
+
+    ResetEvent(g_send_cancel_ev);
+    InterlockedExchange(&g_send_inflight, 1);
+    strncpy(g_send_cur_name, basename_win(path), sizeof(g_send_cur_name)-1);
+    g_send_cur_name[sizeof(g_send_cur_name)-1] = 0;
+
+    PostMessageA(g_hwnd, WM_APP_STATE, 1, 0);
 
     EnterCriticalSection(&g_file_cs);
     SOCKET s = g_sock_file;
@@ -590,6 +623,22 @@ static DWORD WINAPI send_file_thread(LPVOID lp) {
     post_progress(0, fname, 0, fsize, 0.0, 0);
 
     while (sent < fsize) {
+        if (WaitForSingleObject(g_send_cancel_ev, 0) == WAIT_OBJECT_0) {
+            send_file_cancel_notify(fname);
+
+            post_logf("[system] File send canceled: %s\r\n", fname);
+            post_progress(0, fname, sent, fsize, 0.0, 1);
+
+            free(buf);
+            fclose(fp);
+            free(path);
+
+            InterlockedExchange(&g_send_inflight, 0);
+            g_send_cur_name[0] = 0;
+            InterlockedExchange(&g_offer_pending, 0);
+            return 0;
+        }
+
         size_t n = fread(buf, 1, FILE_CHUNK_SZ, fp);
         if (n == 0) break;
 
@@ -617,6 +666,8 @@ static DWORD WINAPI send_file_thread(LPVOID lp) {
     post_progress(0, fname, fsize, fsize, 0.0, 1);
     post_logf("[system] File send finished: %s\r\n", fname);
 
+    InterlockedExchange(&g_send_inflight, 0);
+    g_send_cur_name[0] = 0;
     InterlockedExchange(&g_offer_pending, 0);
     free(path);
     return 0;
@@ -628,6 +679,7 @@ static void update_ui_connected(HWND hWnd, int connected) {
     SetWindowTextA(GetDlgItem(hWnd, IDC_CONNECT), connected ? "Disconnect" : "Connect");
     EnableWindow(GetDlgItem(hWnd, IDC_SEND), connected);
     EnableWindow(GetDlgItem(hWnd, IDC_SENDFILE), connected);
+    EnableWindow(GetDlgItem(hWnd, IDC_CANCELFILE), connected);
 }
 
 static void ui_apply_progress(progress_msg_t *pm) {
@@ -689,6 +741,9 @@ static void create_controls(HWND hWnd) {
     CreateWindowA("BUTTON", "Send", WS_CHILD | WS_VISIBLE, 575, 40, 120, 24, hWnd, (HMENU)IDC_SEND, NULL, NULL);
     CreateWindowA("BUTTON", "Send File", WS_CHILD | WS_VISIBLE, 575, 70, 120, 24, hWnd, (HMENU)IDC_SENDFILE, NULL, NULL);
 
+    CreateWindowA("BUTTON", "Cancel", WS_CHILD | WS_VISIBLE, 575, 110, 120, 24, hWnd, (HMENU)IDC_CANCELFILE, NULL, NULL);
+    EnableWindow(GetDlgItem(hWnd, IDC_CANCELFILE), FALSE);
+
     CreateWindowA("STATIC", "Send:", WS_CHILD | WS_VISIBLE, 10, 74, 45, 18, hWnd, NULL, NULL, NULL);
     g_pbSend = create_progress(hWnd, 60, 72, 505, 18, IDC_PB_SEND);
     g_txSend = CreateWindowA("STATIC", "-", WS_CHILD | WS_VISIBLE, 10, 92, 700, 18, hWnd, (HMENU)IDC_TX_SEND, NULL, NULL);
@@ -721,7 +776,7 @@ static void layout_controls(HWND hWnd, int w, int h) {
     int logH = h - 170;
     if (logH < 60) logH = 60;
 
-    HDWP dwp = BeginDeferWindowPos(30);
+    HDWP dwp = BeginDeferWindowPos(32);
     if (!dwp) return;
 
     dwp = DeferWindowPos(dwp, GetDlgItem(hWnd, IDC_CONNECT), NULL, topRightX, 7, btnW, 24, SWP_NOZORDER);
@@ -729,7 +784,8 @@ static void layout_controls(HWND hWnd, int w, int h) {
     dwp = DeferWindowPos(dwp, GetDlgItem(hWnd, IDC_INPUT), NULL, margin, 40, inputW, 24, SWP_NOZORDER);
     dwp = DeferWindowPos(dwp, GetDlgItem(hWnd, IDC_SEND), NULL, topRightX, 40, btnW, 24, SWP_NOZORDER);
     dwp = DeferWindowPos(dwp, GetDlgItem(hWnd, IDC_SENDFILE), NULL, topRightX, 70, btnW, 24, SWP_NOZORDER);
-
+    dwp = DeferWindowPos(dwp, GetDlgItem(hWnd, IDC_CANCELFILE), NULL, topRightX, 110, btnW, 24, SWP_NOZORDER);
+    
     dwp = DeferWindowPos(dwp, g_pbSend, NULL, 60, 72, pbW, 18, SWP_NOZORDER);
     dwp = DeferWindowPos(dwp, g_txSend, NULL, margin, 92, w - margin*2, 18, SWP_NOZORDER);
 
@@ -879,18 +935,25 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
-        case IDC_CONNECT:
-            if (!InterlockedCompareExchange(&g_connected, 1, 1)) do_connect(hWnd);
-            else do_disconnect();
-            return 0;
+            case IDC_CONNECT:
+                if (!InterlockedCompareExchange(&g_connected, 1, 1)) do_connect(hWnd);
+                else do_disconnect();
+                return 0;
 
-        case IDC_SEND:
-            send_chat(hWnd);
-            return 0;
+            case IDC_SEND:
+                send_chat(hWnd);
+                return 0;
 
-        case IDC_SENDFILE:
-            pick_and_send_file(hWnd);
-            return 0;
+            case IDC_SENDFILE:
+                pick_and_send_file(hWnd);
+                return 0;
+                
+            case IDC_CANCELFILE:
+                if (InterlockedCompareExchange(&g_send_inflight, 1, 1)) {
+                    SetEvent(g_send_cancel_ev);
+                    post_logf("[system] Cancel requested...\r\n");
+                }
+                return 0;
         }
         break;
 
@@ -906,6 +969,25 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     return DefWindowProcA(hWnd, msg, wParam, lParam);
 }
 
+static void send_file_cancel_notify(const char *fname) {
+    EnterCriticalSection(&g_file_cs);
+    SOCKET s = g_sock_file;
+    LeaveCriticalSection(&g_file_cs);
+    if (s == INVALID_SOCKET) return;
+
+    // payload: uint16 fname_len + fname bytes (간단)
+    uint16_t fn_len = (uint16_t)strlen(fname);
+    if (fn_len > 250) fn_len = 250;
+
+    uint16_t net_fn = htons(fn_len);
+    uint8_t payload[2 + 260];
+    memcpy(payload, &net_fn, 2);
+    memcpy(payload + 2, fname, fn_len);
+
+    send_frame(s, MSG_FILE_CANCEL, payload, 2u + fn_len);
+}
+
+
 int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     (void)hPrev; (void)lpCmd;
 
@@ -919,6 +1001,8 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
 
     // offer wait event (manual-reset)
     g_ev_offer = CreateEventA(NULL, TRUE, FALSE, NULL);
+
+    g_send_cancel_ev = CreateEventA(NULL, TRUE, FALSE, NULL);
 
     WNDCLASSA wc;
     memset(&wc, 0, sizeof(wc));
@@ -952,6 +1036,7 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     }
 
     if (g_ev_offer) { CloseHandle(g_ev_offer); g_ev_offer = NULL; }
+    if (g_send_cancel_ev) CloseHandle(g_send_cancel_ev);
 
     DeleteCriticalSection(&g_chat_cs);
     DeleteCriticalSection(&g_file_cs);
