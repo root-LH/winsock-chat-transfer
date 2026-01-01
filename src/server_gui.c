@@ -1,42 +1,10 @@
 #define _CRT_SECURE_NO_WARNINGS
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-#include <commctrl.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdarg.h>
-#include <stdint.h>
+#include "server.h"
 
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Comctl32.lib")
 
-// must match client protocol
-#define MSG_TEXT       1
-#define MSG_FILE_BEGIN 2
-#define MSG_FILE_CHUNK 3
-
-#define MAX_ROOMS 64
-#define ROOM_NAME_MAX 64
-#define NICK_MAX 32
-#define LINE_MAX 256
-#define RELAY_BUF_SZ (256 * 1024)
-
-#define WM_APP_LOG (WM_APP + 1)
-
 enum { IDC_PORT = 101, IDC_LISTEN, IDC_LOG };
-
-typedef struct {
-    char name[ROOM_NAME_MAX];
-    SOCKET chat[2];
-    SOCKET file[2];
-    char chat_nick[2][NICK_MAX];
-    char file_nick[2][NICK_MAX];
-    int used;
-} room_t;
-
-typedef struct { SOCKET a, b; } relay_arg_t;
 
 static HWND g_hwnd = NULL;
 static HWND g_editLog = NULL;

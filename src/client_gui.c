@@ -5,25 +5,6 @@
 #pragma comment(lib, "Comdlg32.lib")
 #pragma comment(lib, "Comctl32.lib")
 
-#define MSG_TEXT        1
-#define MSG_FILE_BEGIN  2   // now: OFFER (fname+size)
-#define MSG_FILE_CHUNK  3
-#define MSG_FILE_ACCEPT 4
-#define MSG_FILE_REJECT 5
-
-#define IO_BUF_SZ      (256 * 1024)
-#define FILE_CHUNK_SZ  (256 * 1024)
-#define SOCKBUF_SZ     (4 * 1024 * 1024)
-
-#define PROGRESS_MS    200
-#define RATE_UPDATE_MS 500
-
-#define WM_APP_LOG       (WM_APP + 1)
-#define WM_APP_STATE     (WM_APP + 2)
-#define WM_APP_PROGRESS  (WM_APP + 3)
-
-#define NICK_MAX 32
-
 enum {
     IDC_IP = 101,
     IDC_PORT,
@@ -39,31 +20,6 @@ enum {
     IDC_TX_SEND,
     IDC_TX_RECV
 };
-
-typedef struct {
-    int which;            // 0=send, 1=recv
-    uint64_t done_bytes;
-    uint64_t total_bytes;
-    double speed_bps;
-    char name[260];
-    int done;
-} progress_msg_t;
-
-typedef struct {
-    int active;     // actively writing file
-    int discard;    // receiver rejected; discard any chunks if they arrive anyway
-    FILE *fp;
-    char outname[300];
-    uint64_t total;
-    uint64_t recvd;
-
-    ULONGLONG last_ui;
-    ULONGLONG start_time;
-
-    uint64_t last_recvd;
-    ULONGLONG last_rate_t;
-    double last_speed_bps;
-} recv_file_state_t;
 
 static HWND g_hwnd = NULL;
 static HWND g_editLog = NULL;
